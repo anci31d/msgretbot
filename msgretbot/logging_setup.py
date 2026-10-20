@@ -10,15 +10,25 @@ FILE_BYTES = 5 * 1024 * 1024
 
 
 class CompactFormatter(logging.Formatter):
+    def __init__(self, fmt, *, debug=False, secrets=()):
+        super().__init__(fmt)
+        self.debug = debug
+        self.secrets = tuple(secret for secret in secrets if secret)
+
     def format(self, record):
         # Exception messages/tracebacks may include Telegram requests and credentials.
         record = logging.makeLogRecord(record.__dict__)
         error = record.exc_info[0].__name__ if record.exc_info else None
+        details = str(record.exc_info[1]) if self.debug and record.exc_info else None
         record.exc_info = record.exc_text = record.stack_info = None
         result = super().format(record)
         if error:
             result += f" error_type={error}"
-        return result[:4000]
+        if details is not None:
+            result += f": {details}"
+        for secret in self.secrets:
+            result = result.replace(secret, "[REDACTED]")
+        return result if self.debug else result[:4000]
 
 
 class ByteRotatingHandler(RotatingFileHandler):
@@ -36,7 +46,7 @@ class ByteRotatingHandler(RotatingFileHandler):
         return size > 0 and size + len(encoded) >= self.maxBytes
 
 
-def configure_logging(config: LoggingConfig) -> logging.Handler:
+def configure_logging(config: LoggingConfig, *, secrets=()) -> logging.Handler:
     if config.output == "file":
         path = Path(config.file).resolve()
         if not path.is_relative_to(Path.cwd().resolve()):
@@ -45,7 +55,8 @@ def configure_logging(config: LoggingConfig) -> logging.Handler:
         handler = ByteRotatingHandler(path, maxBytes=FILE_BYTES, backupCount=1, encoding="utf-8")
     else:
         handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(CompactFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.setFormatter(CompactFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s",
+                                         debug=config.level == "DEBUG", secrets=secrets))
     logger = logging.getLogger("msgretbot")
     for previous in logger.handlers[:]:
         logger.removeHandler(previous)

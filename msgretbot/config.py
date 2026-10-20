@@ -5,6 +5,10 @@ import tomllib
 from dataclasses import dataclass, field
 
 
+class InvalidGroupId(ValueError):
+    """A numeric group ID cannot be represented by Telegram or SQLite."""
+
+
 @dataclass(frozen=True)
 class LoggingConfig:
     output: str = "stdout"
@@ -35,6 +39,9 @@ class Config:
             raise ValueError("groups must contain negative numeric group IDs")
         if len(groups) != len(set(groups)):
             raise ValueError("groups must not contain duplicates")
+        if any(g < -(2**63) for g in groups):
+            raise InvalidGroupId("Group ID exceeds signed 64-bit range; use the actual Telegram "
+                             "group ID (supergroup IDs have the form -100...), not a concatenated ID")
         api_id = int(os.environ["TELEGRAM_API_ID"])
         api_hash = os.environ["TELEGRAM_API_HASH"]
         token = os.environ.get("TELEGRAM_BOT_TOKEN")

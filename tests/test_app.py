@@ -56,3 +56,21 @@ async def test_login_only_authorizes_and_disconnects(tmp_path, monkeypatch, caps
     client.disconnect.assert_awaited_once()
     assert "No group messages sent" in capsys.readouterr().out
     assert not (tmp_path / "messages.sqlite3").exists()
+
+
+async def test_graceful_termination_closes_application_resources(tmp_path, monkeypatch):
+    import asyncio
+    from msgretbot.app import serve
+    ready, closed = asyncio.Event(), asyncio.Event()
+    async def running(config, command):
+        try:
+            ready.set()
+            await asyncio.Future()
+        finally:
+            closed.set()
+    monkeypatch.setattr("msgretbot.app.run", running)
+    task = asyncio.create_task(serve(configuration(tmp_path), "run"))
+    await ready.wait()
+    task.cancel()
+    await task
+    assert closed.is_set()

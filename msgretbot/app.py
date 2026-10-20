@@ -4,11 +4,12 @@ import asyncio
 import fcntl
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from aiogram import Bot
 from telethon import TelegramClient, events
-from .config import Config, LoggingConfig
+from .config import Config, LoggingConfig, InvalidGroupId
 from .logging_setup import configure_logging
 from .service import Recovery
 from .storage import Store
@@ -70,7 +71,7 @@ async def run(config: Config, command: str):
                           event.message.id, queue.qsize())
 
         async def on_deleted(event):
-            # Channel deletions cannot belong to a basic group.
+            # For supergroups Telegram supplies the channel peer in chat_id.
             if event.chat_id is None or event.chat_id in service.groups:
                 await queue.put(("deleted", (event.deleted_ids, event.chat_id)))
 
@@ -129,24 +130,38 @@ async def run(config: Config, command: str):
         log.info("Application stopped")
 
 
+async def serve(config: Config, command: str):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await run(config, command)
+    except asyncio.CancelledError:
+        log.info("Termination requested; application resources closed")
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Restore deleted text messages in basic Telegram groups")
+    parser = argparse.ArgumentParser(description="Restore deleted text messages in Telegram groups and supergroups")
     parser.add_argument("command", choices=("login", "run"))
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     args = parser.parse_args()
     configured = False
     try:
         config = Config.load(args.config)
-        configure_logging(config.logging)
+        configure_logging(config.logging, secrets=(config.api_hash, config.bot_token))
         configured = True
-        asyncio.run(run(config, args.command))
+        asyncio.run(serve(config, args.command))
     except KeyboardInterrupt:
         pass
     except Exception as error:
         if not configured:
             configure_logging(LoggingConfig())
+        if isinstance(error, InvalidGroupId):
+            log.error("Invalid configuration: %s", error)
         log.error("Startup or worker failed (%s); check configuration, connectivity and permissions",
-                  type(error).__name__)
+                  type(error).__name__, exc_info=True)
         raise SystemExit(1) from None
 
 

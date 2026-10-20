@@ -68,3 +68,16 @@ def test_file_outside_workspace_rejected(tmp_path, monkeypatch):
     monkeypatch.chdir(root)
     with pytest.raises(ValueError):
         configure_logging(LoggingConfig("file", "INFO", tmp_path / "outside.log"))
+
+
+def test_debug_exception_full_message_and_secret_redaction(capsys):
+    configure_logging(LoggingConfig(level="DEBUG"), secrets=("test-secret", None))
+    details = "failure " + "x" * 5000 + " test-secret END"
+    try:
+        raise OverflowError(details)
+    except OverflowError:
+        logging.getLogger("msgretbot.app").error("Startup failed", exc_info=True)
+    output = capsys.readouterr().out
+    assert "error_type=OverflowError: failure " + "x" * 5000 in output
+    assert "[REDACTED] END" in output
+    assert "test-secret" not in output

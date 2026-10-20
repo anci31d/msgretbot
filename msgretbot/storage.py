@@ -1,13 +1,16 @@
-"""SQLite persistence and transactional notification queue."""
+"""Bounded SQLite persistence and transactional notification queue."""
 import asyncio
 from dataclasses import asdict
 import json
 import logging
+import math
 from pathlib import Path
+import sqlite3
 import aiosqlite
 from .models import Message, TTL
 
 log = logging.getLogger(__name__)
+DATABASE_BYTES = 50 * 1024 * 1024
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -34,26 +37,55 @@ PRAGMA user_version=1;
 """
 
 
+class DatabaseCapacityError(Exception):
+    """An existing database or a single operation cannot fit the disk budget."""
+
+
 class Store:
-    def __init__(self, db: aiosqlite.Connection):
+    def __init__(self, db: aiosqlite.Connection, page_size: int, page_limit: int):
         self.db = db
+        self.page_size = page_size
+        self.page_limit = page_limit
         self.lock = asyncio.Lock()
 
     @classmethod
-    async def open(cls, path: Path):
+    async def open(cls, path: Path, max_bytes: int = DATABASE_BYTES):
         path.parent.mkdir(parents=True, exist_ok=True)
         db = await aiosqlite.connect(path, isolation_level=None)
         db.row_factory = aiosqlite.Row
         try:
-            await db.execute("PRAGMA foreign_keys=ON")
-            await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA busy_timeout=5000")
+            page_size = (await (await db.execute("PRAGMA page_size")).fetchone())[0]
+            page_count = (await (await db.execute("PRAGMA page_count")).fetchone())[0]
+            # Reserve a second copy of every page for the rollback journal, plus
+            # journal headers, page record overhead and sector alignment.
+            overhead = min(1024 * 1024, max(64 * 1024, max_bytes // 50))
+            page_limit = (max_bytes - overhead) // (2 * page_size)
+            if page_limit < 32 or page_count > page_limit:
+                log.error("Existing database exceeds safe capacity pages=%s limit=%s; offline compaction required",
+                          page_count, page_limit)
+                raise DatabaseCapacityError("Database cannot fit the bounded rollback-journal budget")
+            await db.execute(f"PRAGMA max_page_count={page_limit}")
+            # One in-memory dirty-page set prevents multiple journal headers due
+            # to cache spills. No disk-backed sort/temp files are needed.
+            await db.execute("PRAGMA cache_spill=OFF")
+            await db.execute("PRAGMA temp_store=MEMORY")
+            journal = (await (await db.execute("PRAGMA journal_mode=TRUNCATE")).fetchone())[0]
+            if journal != "truncate":
+                raise DatabaseCapacityError("Cannot enable bounded rollback journal")
+            await db.execute("PRAGMA journal_size_limit=0")
+            await db.execute("PRAGMA synchronous=FULL")
+            await db.execute("PRAGMA foreign_keys=ON")
             row = await (await db.execute("PRAGMA user_version")).fetchone()
             if row[0] > 1:
                 raise ValueError("Database schema is newer than this application")
             await db.executescript(SCHEMA)
-            log.info("Database opened schema=1 journal=WAL")
-            return cls(db)
+            store = cls(db, page_size, page_limit)
+            async with store.lock:
+                await store._make_room(32 * 1024)
+            log.info("Database opened schema=1 journal=TRUNCATE total_budget=%s main_limit=%s",
+                     max_bytes, page_limit * page_size)
+            return store
         except BaseException:
             await db.close()
             raise
@@ -65,12 +97,65 @@ class Store:
     def message(row) -> Message:
         return Message(**{key: row[key] for key in Message.__dataclass_fields__})
 
+    @staticmethod
+    def key(message: Message):
+        return message.account, message.chat, message.id
+
+    async def _evict_oldest(self, protected=None) -> int:
+        restriction, params = "", []
+        if protected is not None:
+            restriction = " WHERE NOT (account=? AND chat=? AND id=?)"
+            params.extend(protected)
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            removed = await self.db.execute("""DELETE FROM messages WHERE rowid IN
+                (SELECT rowid FROM messages""" + restriction +
+                " ORDER BY sent_at,account,chat,id LIMIT 16)", params)
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
+        if removed.rowcount:
+            log.warning("Database capacity eviction count=%s; oldest messages and related deliveries removed",
+                        removed.rowcount)
+        return removed.rowcount
+
+    async def _make_room(self, reserve: int, protected=None):
+        required = math.ceil(reserve / self.page_size) + 4
+        if required > self.page_limit - 16:
+            raise DatabaseCapacityError("Operation is larger than the database budget")
+        while True:
+            pages = (await (await self.db.execute("PRAGMA page_count")).fetchone())[0]
+            free = (await (await self.db.execute("PRAGMA freelist_count")).fetchone())[0]
+            if self.page_limit - pages + free >= required:
+                return
+            if not await self._evict_oldest(protected):
+                raise DatabaseCapacityError("Operation cannot fit without losing its protected message")
+
+    async def _write(self, operation, protected=None, reserve: int = 32 * 1024):
+        async with self.lock:
+            await self._make_room(reserve, protected)
+            while True:
+                await self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    result = await operation()
+                    await self.db.commit()
+                    return result
+                except BaseException as error:
+                    await self.db.rollback()
+                    if isinstance(error, sqlite3.DatabaseError) and (
+                            getattr(error, "sqlite_errorcode", 0) & 255) == sqlite3.SQLITE_FULL:
+                        if await self._evict_oldest(protected):
+                            continue
+                        raise DatabaseCapacityError("No reclaimable space remains") from None
+                    raise
+
     async def save(self, message: Message, now: float):
         if message.sent_at <= now - TTL:
             log.debug("Expired message skipped chat=%s message=%s", message.chat, message.id)
-            return
+            return False
         values = asdict(message)
-        async with self.lock:
+        async def operation():
             await self.db.execute("""
                 INSERT INTO messages(account,chat,id,author,name,username,sent_at,text,kind,own_alert,revision_at)
                 VALUES(:account,:chat,:id,:author,:name,:username,:sent_at,:text,:kind,:own_alert,:revision_at)
@@ -81,9 +166,16 @@ class Store:
                   revision_at=MAX(messages.revision_at,excluded.revision_at),
                   own_alert=MAX(messages.own_alert,excluded.own_alert)
                 """, values)
-            log.info("Message saved account=%s chat=%s message=%s kind=%s own_alert=%s revision=%s",
-                     message.account, message.chat, message.id, message.kind,
-                     bool(message.own_alert), message.revision_at)
+        payload_bytes = sum(len(value.encode("utf-8")) for value in values.values() if isinstance(value, str))
+        try:
+            await self._write(operation, self.key(message), reserve=payload_bytes + 32 * 1024)
+        except DatabaseCapacityError:
+            log.error("Message exceeds database capacity; not saved chat=%s message=%s", message.chat, message.id)
+            return False
+        log.info("Message saved account=%s chat=%s message=%s kind=%s own_alert=%s revision=%s",
+                 message.account, message.chat, message.id, message.kind,
+                 bool(message.own_alert), message.revision_at)
+        return True
 
     async def cleanup(self, now: float):
         async with self.lock:
@@ -112,22 +204,18 @@ class Store:
         return found
 
     async def deleted(self, message: Message, now: float):
-        async with self.lock:
-            await self.db.execute("BEGIN IMMEDIATE")
-            try:
-                key = (message.account, message.chat, message.id)
-                await self.db.execute("""UPDATE messages SET deleted=1
-                    WHERE account=? AND chat=? AND id=? AND sent_at>?""", (*key, now-TTL))
-                queued = await self.db.execute("""INSERT OR IGNORE INTO deliveries(account,chat,id)
-                    SELECT account,chat,id FROM messages WHERE account=? AND chat=? AND id=?
-                    AND deleted=1 AND sent_at>? AND kind='text' AND text IS NOT NULL AND own_alert=0""",
-                    (*key, now-TTL))
-                await self.db.commit()
-                log.info("Message deletion recorded account=%s chat=%s message=%s queued=%s",
-                         message.account, message.chat, message.id, bool(queued.rowcount))
-            except BaseException:
-                await self.db.rollback()
-                raise
+        async def operation():
+            key = self.key(message)
+            await self.db.execute("""UPDATE messages SET deleted=1
+                WHERE account=? AND chat=? AND id=? AND sent_at>?""", (*key, now-TTL))
+            queued = await self.db.execute("""INSERT OR IGNORE INTO deliveries(account,chat,id)
+                SELECT account,chat,id FROM messages WHERE account=? AND chat=? AND id=?
+                AND deleted=1 AND sent_at>? AND kind='text' AND text IS NOT NULL AND own_alert=0""",
+                (*key, now-TTL))
+            return bool(queued.rowcount)
+        queued = await self._write(operation, self.key(message))
+        log.info("Message deletion recorded account=%s chat=%s message=%s queued=%s",
+                 message.account, message.chat, message.id, queued)
 
     async def candidates(self, original: Message, now: float) -> list[Message]:
         rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
@@ -157,9 +245,11 @@ class Store:
             + restriction + " ORDER BY m.sent_at,m.id LIMIT 1", params)).fetchone()
 
     async def prepare(self, message: Message, parts: list[str]):
-        async with self.lock:
+        payload = json.dumps(parts)
+        async def operation():
             await self.db.execute("""UPDATE deliveries SET parts=? WHERE account=? AND chat=? AND id=?
-                AND parts IS NULL""", (json.dumps(parts), message.account, message.chat, message.id))
+                AND parts IS NULL""", (payload, *self.key(message)))
+        await self._write(operation, self.key(message), reserve=len(payload.encode()) + 32 * 1024)
 
     async def pending_parts(self, account: int, chat: int, now: float) -> list[str]:
         rows = await (await self.db.execute("""SELECT d.parts FROM deliveries d
@@ -169,32 +259,22 @@ class Store:
         return [part for row in rows for part in json.loads(row["parts"])]
 
     async def postpone(self, message: Message, until: float, global_delay: bool = False):
-        async with self.lock:
-            await self.db.execute("BEGIN IMMEDIATE")
-            try:
-                await self.db.execute("UPDATE deliveries SET next_at=? WHERE account=? AND chat=? AND id=?",
-                                      (until, message.account, message.chat, message.id))
-                if global_delay:
-                    await self.db.execute("""INSERT INTO cooldowns(account,until) VALUES(?,?)
-                        ON CONFLICT(account) DO UPDATE SET until=MAX(until,excluded.until)""",
-                        (message.account, until))
-                await self.db.commit()
-            except BaseException:
-                await self.db.rollback()
-                raise
+        async def operation():
+            await self.db.execute("UPDATE deliveries SET next_at=? WHERE account=? AND chat=? AND id=?",
+                                  (until, *self.key(message)))
+            if global_delay:
+                await self.db.execute("""INSERT INTO cooldowns(account,until) VALUES(?,?)
+                    ON CONFLICT(account) DO UPDATE SET until=MAX(until,excluded.until)""",
+                    (message.account, until))
+        await self._write(operation, self.key(message))
 
     async def delivered(self, message: Message, part: int, total: int, alert: Message, now: float):
-        async with self.lock:
-            await self.db.execute("BEGIN IMMEDIATE")
-            try:
-                await self.db.execute("""INSERT INTO messages
-                    (account,chat,id,author,name,username,sent_at,text,kind,own_alert)
-                    VALUES(:account,:chat,:id,:author,:name,:username,:sent_at,:text,:kind,1)
-                    ON CONFLICT(account,chat,id) DO UPDATE SET own_alert=1""", asdict(alert))
-                await self.db.execute("""UPDATE deliveries SET next_part=?,done=?,next_at=?
-                    WHERE account=? AND chat=? AND id=?""",
-                    (part+1, int(part+1 == total), now, message.account, message.chat, message.id))
-                await self.db.commit()
-            except BaseException:
-                await self.db.rollback()
-                raise
+        async def operation():
+            await self.db.execute("""INSERT INTO messages
+                (account,chat,id,author,name,username,sent_at,text,kind,own_alert)
+                VALUES(:account,:chat,:id,:author,:name,:username,:sent_at,:text,:kind,1)
+                ON CONFLICT(account,chat,id) DO UPDATE SET own_alert=1""", asdict(alert))
+            await self.db.execute("""UPDATE deliveries SET next_part=?,done=?,next_at=?
+                WHERE account=? AND chat=? AND id=?""",
+                (part+1, int(part+1 == total), now, *self.key(message)))
+        await self._write(operation, self.key(message))

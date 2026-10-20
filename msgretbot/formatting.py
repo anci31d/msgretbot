@@ -49,7 +49,7 @@ def author(message: Message) -> str:
 
 
 class QuoteContext:
-    """Basic groups have no standard message permalinks."""
+    """Render portable quotes; supergroup links can be added by a future formatter."""
 
     def render(self, messages: list[Message]) -> str:
         if not messages:

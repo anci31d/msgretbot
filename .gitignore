@@ -17,3 +17,6 @@ dist/
 logs/
 *.log
 *.log.1
+.cache/
+*.vars
+!tests/fixtures/docker-test.vars

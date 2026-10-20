@@ -37,6 +37,10 @@ class Recovery:
             log.debug("Deletion event received chat=%s count=%s", chat, len(ids))
             for message in await self.store.matching(self.account, ids, self.clock()):
                 if message.chat in self.groups and (chat is None or chat == message.chat):
+                    # Unscoped deletions address only the account-wide basic-chat ID space.
+                    # Channel message IDs are local to each supergroup.
+                    if chat is None and message.chat <= -1000000000000:
+                        continue
                     await self.store.deleted(message, self.clock())
 
     async def reconcile(self):

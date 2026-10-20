@@ -35,6 +35,12 @@ def test_userbot_needs_no_bot_token(config_path, monkeypatch):
     assert Config.load(config_path).bot_token is None
 
 
+def test_oversized_group_id_rejected(config_path):
+    config_path.write_text('mode="userbot"\ngroups=[-100100123456789012345]')
+    with pytest.raises(ValueError, match="64-bit range"):
+        Config.load(config_path)
+
+
 def test_logging_defaults_and_file_configuration(config_path):
     config_path.write_text('groups=[-10]')
     assert Config.load(config_path).logging.output == "stdout"

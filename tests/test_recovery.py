@@ -133,7 +133,7 @@ async def test_sqlite_migration_version(setup):
     row = await (await setup.store.db.execute("PRAGMA user_version")).fetchone()
     assert row[0] == 1
     row = await (await setup.store.db.execute("PRAGMA journal_mode")).fetchone()
-    assert row[0] == "wal"
+    assert row[0] == "truncate"
 
 
 async def test_userbot_lost_ack_alert_recognized_from_durable_payload(setup, message):
@@ -252,3 +252,22 @@ async def test_operational_logs_exclude_message_contents(setup, message, caplog)
     assert "Alert sent" in caplog.text
     assert "Expired messages purged" in caplog.text
     assert "DO-NOT-LOG" not in caplog.text
+
+
+async def test_supergroup_deletions_do_not_cross_chat_id_spaces(setup, message):
+    first, second = -1000000000100, -1000000000200
+    service = Recovery(setup.store, setup.reader, setup.sender, 1,
+                       (-10, first, second), 99, clock=lambda: NOW)
+    for chat in (-10, first, second):
+        await service.record(message(10, chat=chat))
+    await service.deletion([10])
+    assert await service.deliver_once()
+    assert setup.sender.calls[-1][0] == -10
+    assert not await service.deliver_once()
+    await service.deletion([10], first)
+    assert await service.deliver_once()
+    assert setup.sender.calls[-1][0] == first
+    assert [m.id for m in await setup.store.active(1, second, NOW)] == [10]
+    await service.deletion([10], second)
+    assert await service.deliver_once()
+    assert setup.sender.calls[-1][0] == second

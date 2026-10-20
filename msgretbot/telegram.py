@@ -61,8 +61,12 @@ class TelegramReader:
         for group in self.groups:
             await self.throttle()
             entity = await self.client.get_entity(group)
-            if not isinstance(entity, types.Chat) or entity.deactivated or entity.left or entity.migrated_to:
-                raise ValueError("Configured destination must be an accessible basic group")
+            is_basic = isinstance(entity, types.Chat)
+            is_supergroup = isinstance(entity, types.Channel) and entity.megagroup
+            if ((not is_basic and not is_supergroup) or getattr(entity, "deactivated", False)
+                    or entity.left or getattr(entity, "migrated_to", None)
+                    or getattr(entity, "gigagroup", False) or getattr(entity, "broadcast", False)):
+                raise ValueError("Configured destination must be an accessible group or supergroup")
             self.entities[group] = entity
             log.info("Group validated chat=%s", group)
 
@@ -83,10 +87,16 @@ class TelegramReader:
             return states
         try:
             await self.throttle()
-            # Validate membership first: basic-group getMessages is account-wide.
-            result = await self.client(functions.messages.GetFullChatRequest(self.entities[chat].id))
+            entity = self.entities[chat]
+            if isinstance(entity, types.Channel) and entity.megagroup:
+                result = await self.client(functions.channels.GetFullChannelRequest(entity))
+            else:
+                # Validate membership first: basic-group getMessages is account-wide.
+                result = await self.client(functions.messages.GetFullChatRequest(entity.id))
             entity = next((c for c in result.chats if c.id == self.entities[chat].id), None)
-            if not isinstance(entity, types.Chat) or entity.left or entity.deactivated or entity.migrated_to:
+            valid = isinstance(entity, types.Chat) or (isinstance(entity, types.Channel) and entity.megagroup)
+            if (not valid or entity.left or getattr(entity, "deactivated", False)
+                    or getattr(entity, "migrated_to", None)):
                 return states
             await self.throttle()
             messages = await self.client.get_messages(self.entities[chat], ids=ids)
@@ -159,7 +169,7 @@ class UserSender:
                 if isinstance(update, types.UpdateMessageID) and update.random_id == random_id:
                     return update.id
             matching = [update.message.id for update in getattr(response, "updates", [])
-                        if isinstance(update, types.UpdateNewMessage) and update.message.out
+                        if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)) and update.message.out
                         and utils.get_peer_id(update.message.peer_id) == chat
                         and update.message.message == text]
             if len(matching) == 1:

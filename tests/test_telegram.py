@@ -210,3 +210,83 @@ async def test_user_sender_reply_target_and_disappearing_reply():
     assert first.reply_to.reply_to_msg_id == 7
     assert second.reply_to is None
     assert first.random_id == second.random_id
+
+
+def supergroup(**changes):
+    values = dict(id=100, title="Test", photo=types.ChatPhotoEmpty(), date=NOW,
+                  megagroup=True, access_hash=1)
+    values.update(changes)
+    return types.Channel(**values)
+
+
+@pytest.mark.parametrize("changes", [{}, {"forum": True}])
+async def test_validate_supergroup(changes):
+    client = Client()
+    client.get_entity = AsyncMock(return_value=supergroup(**changes))
+    reader = TelegramReader(client, (-1000000000100,))
+    reader.throttle = AsyncMock()
+    await reader.validate()
+    assert reader.entities[-1000000000100].megagroup
+
+
+@pytest.mark.parametrize("changes", [dict(megagroup=False, broadcast=True),
+                                      dict(left=True), dict(gigagroup=True)])
+async def test_validate_rejects_inaccessible_or_broadcast_channel(changes):
+    client = Client()
+    client.get_entity = AsyncMock(return_value=supergroup(**changes))
+    reader = TelegramReader(client, (-1000000000100,))
+    reader.throttle = AsyncMock()
+    with pytest.raises(ValueError):
+        await reader.validate()
+
+
+async def test_supergroup_presence_and_access_loss():
+    from telethon import functions
+    chat = -1000000000100
+    client = Client()
+    client.call.return_value = SimpleNamespace(chats=[supergroup()])
+    client.get_messages.return_value = [SimpleNamespace(chat_id=chat), None]
+    reader = TelegramReader(client, (chat,))
+    reader.entities[chat] = supergroup()
+    reader.throttle = AsyncMock()
+    assert await reader.presence(chat, [1, 2]) == {1: Presence.PRESENT, 2: Presence.DELETED}
+    assert isinstance(client.call.call_args.args[0], functions.channels.GetFullChannelRequest)
+    client.call.side_effect = errors.ChannelPrivateError(None)
+    assert await reader.presence(chat, [1, 2]) == {1: Presence.UNKNOWN, 2: Presence.UNKNOWN}
+    client.get_messages.assert_awaited_once()
+
+
+async def test_user_sender_supergroup_update_fallback():
+    chat = -1000000000100
+    client = Client()
+    message = types.Message(id=77, peer_id=types.PeerChannel(channel_id=100),
+                            date=NOW, out=True, message="alert")
+    client.call.return_value = types.Updates(
+        updates=[types.UpdateNewChannelMessage(message=message, pts=1, pts_count=1)],
+        users=[], chats=[], date=NOW, seq=1)
+    assert await UserSender(client, {chat: supergroup()}).send(chat, "alert", "key") == 77
+
+
+async def test_telethon_supergroup_delete_event_has_scoped_chat():
+    from telethon import events
+    event = events.MessageDeleted.build(types.UpdateDeleteChannelMessages(
+        channel_id=100, messages=[7, 8], pts=1, pts_count=2))
+    assert event.chat_id == -1000000000100
+    assert event.deleted_ids == [7, 8]
+    unscoped = events.MessageDeleted.build(types.UpdateDeleteMessages(
+        messages=[7], pts=1, pts_count=1))
+    assert unscoped.chat_id is None
+
+
+async def test_supergroup_left_and_wrong_peer_remain_unknown():
+    chat = -1000000000100
+    client = Client()
+    reader = TelegramReader(client, (chat,))
+    reader.entities[chat] = supergroup()
+    reader.throttle = AsyncMock()
+    client.call.return_value = SimpleNamespace(chats=[supergroup(left=True)])
+    assert await reader.presence(chat, [7]) == {7: Presence.UNKNOWN}
+    client.get_messages.assert_not_awaited()
+    client.call.return_value = SimpleNamespace(chats=[supergroup()])
+    client.get_messages.return_value = [SimpleNamespace(chat_id=-1000000000200)]
+    assert await reader.presence(chat, [7]) == {7: Presence.UNKNOWN}
