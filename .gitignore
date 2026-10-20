@@ -20,3 +20,9 @@ logs/
 .cache/
 *.vars
 !tests/fixtures/docker-test.vars
+plan.md
+STATUS.md
+notes/
+*.env.fish
+*.vars.*
+!telegram.vars.example

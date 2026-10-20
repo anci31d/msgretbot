@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.lock
+!pyproject.toml
+!README.md
+!LICENSE
+!msgretbot/
+!msgretbot/*.py
+msgretbot/**
+!msgretbot/*.py

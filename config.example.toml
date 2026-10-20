@@ -1,0 +1,10 @@
+# Use real Telegram group IDs. Supergroups use marked IDs such as -1001234567890.
+mode = "userbot" # "userbot" or "hybrid"
+groups = [-123456789]
+database = "data/messages.sqlite3"
+session = "data/observer.session"
+
+[logging]
+output = "stdout" # "stdout" or "file"
+level = "INFO" # DEBUG includes full exception messages.
+file = "logs/msgretbot.log"

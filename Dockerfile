@@ -2,7 +2,7 @@ FROM python:3.14-slim AS builder
 WORKDIR /build
 COPY requirements.lock ./
 RUN python -m pip install --no-cache-dir --prefix=/install -r requirements.lock
-COPY pyproject.toml ./
+COPY pyproject.toml README.md LICENSE ./
 COPY msgretbot ./msgretbot
 RUN python -m pip install --no-cache-dir --no-deps --prefix=/install .
 

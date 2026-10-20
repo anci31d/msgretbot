@@ -1,0 +1,8 @@
+# Replace placeholders locally. Never commit telegram.vars.
+TELEGRAM_API_ID=
+TELEGRAM_API_HASH=
+# Required only in hybrid mode.
+TELEGRAM_BOT_TOKEN=
+# Set to the owner of the data and logs directories: id -u / id -g.
+MSGRETBOT_UID=1000
+MSGRETBOT_GID=1000

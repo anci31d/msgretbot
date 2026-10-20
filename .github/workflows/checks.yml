@@ -1,0 +1,38 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest -q
+      - run: git diff --check
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --env-file tests/fixtures/docker-test.vars config --quiet
+      - run: docker build -t msgretbot:test .
+      - run: docker run --rm --network none --read-only --entrypoint python msgretbot:test -m pip check
+      - name: Offline recovery smoke
+        run: >-
+          docker run --rm --network none --read-only --cap-drop ALL
+          --security-opt no-new-privileges:true
+          --tmpfs /app/data:uid=1000,gid=1000,mode=700
+          --mount type=bind,source="$PWD/tests/fixtures/docker_smoke.py",target=/app/smoke.py,readonly
+          --entrypoint python msgretbot:test /app/smoke.py
