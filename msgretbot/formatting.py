@@ -2,10 +2,11 @@
 
 from html import escape
 from html.parser import HTMLParser
+import re
 from .models import Message
 
 
-def plain_text(html: str) -> str:
+def plain_text(html: str, *, strip: bool = True) -> str:
     """Extract the visible payload to recognize outgoing alerts after a lost ACK."""
 
     class Text(HTMLParser):
@@ -18,7 +19,8 @@ def plain_text(html: str) -> str:
 
     parser = Text()
     parser.feed(html)
-    return "".join(parser.parts).strip()
+    text = "".join(parser.parts)
+    return text.strip() if strip else text
 
 
 def units(text: str) -> int:
@@ -48,6 +50,17 @@ def author(message: Message) -> str:
     return f'<a href="tg://user?id={message.author}">{name}</a>'
 
 
+def context_author(message: Message) -> str:
+    """Use ordinary profile URLs instead of notification-producing mention entities."""
+    if message.username and re.fullmatch(r"[A-Za-z0-9_]{1,32}", message.username):
+        return f'<a href="https://t.me/{message.username}">{message.username}</a>'
+    # Without a public username Telegram only offers ID mentions, which can notify.
+    name = (message.name or "Участник")[:100]
+    if not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9 _.'-]+", name):
+        name = "Участник"
+    return escape(name)
+
+
 class QuoteContext:
     """Render portable quotes; supergroup links can be added by a future formatter."""
 
@@ -57,16 +70,20 @@ class QuoteContext:
         lines = ["Контекст:"]
         for index, message in enumerate(messages, 1):
             text = message.text or ""
-            quote = text[:160] + ("…" if len(text) > 160 else "")
-            lines.append(f"{index}. {author(message)}: {escape(quote)}")
+            quote = text[:99] + "…" if len(text) > 100 else text
+            lines.append(f"{index}. {context_author(message)}: <code>{escape(quote)}</code>")
         return "\n".join(lines)
 
 
 def render(message: Message, context: list[Message], formatter=None) -> list[str]:
     formatter = formatter or QuoteContext()
     header = f"!!! 1984 АЛЕРТ !!!\nСообщение {author(message)} удалено:\n"
-    # Reserve enough space even for names and quotes made entirely of astral emoji.
-    texts = chunks(message.text or "", 2100)
+    context_html = "\n" + formatter.render(context)
+    # Ten quotes can consume most of Telegram's UTF-16 budget.
+    limit = min(2100, 4096 - units(plain_text(header + context_html, strip=False)))
+    if limit < 2:
+        raise ValueError("Alert header and context exceed Telegram's message limit")
+    texts = chunks(message.text or "", limit)
     parts = [header + "<pre>" + escape(text) + "</pre>" for text in texts]
-    parts[-1] += "\n" + formatter.render(context)
+    parts[-1] += context_html
     return parts

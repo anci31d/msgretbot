@@ -4,7 +4,6 @@ import hashlib
 import logging
 import time
 from aiogram import Bot
-from aiogram.types import ReplyParameters
 from aiogram.exceptions import (TelegramRetryAfter, TelegramNetworkError,
                                 TelegramServerError, TelegramForbiddenError, TelegramBadRequest)
 from telethon import errors, functions, types, utils
@@ -124,22 +123,16 @@ class AiogramSender:
     def __init__(self, bot: Bot):
         self.bot = bot
 
-    async def send(self, chat: int, html: str, delivery_key: str, reply_to: int | None = None) -> int:
+    async def send(self, chat: int, html: str, delivery_key: str) -> int:
         try:
             message = await self.bot.send_message(chat, html, parse_mode="HTML",
-                                                 link_preview_options={"is_disabled": True},
-                                                 reply_parameters=ReplyParameters(message_id=reply_to,
-                                                     allow_sending_without_reply=True) if reply_to is not None else None)
+                                                 link_preview_options={"is_disabled": True})
             return message.message_id
         except TelegramRetryAfter as error:
             raise RetryDelivery(error.retry_after) from None
         except (TelegramNetworkError, TelegramServerError, OSError, asyncio.TimeoutError):
             raise RetryDelivery(5) from None
         except TelegramBadRequest as error:
-            if reply_to is not None and any(reason in error.message.lower() for reason in
-                    ("message to be replied not found", "reply message not found")):
-                log.warning("Reply target disappeared chat=%s reply_to=%s; sending unthreaded", chat, reply_to)
-                return await self.send(chat, html, delivery_key)
             log.warning("Bot delivery rejected chat=%s error_type=%s", chat, type(error).__name__)
             raise PermanentDelivery from None
         except TelegramForbiddenError:
@@ -154,15 +147,14 @@ class UserSender:
     def __init__(self, client, entities):
         self.client, self.entities = client, entities
 
-    async def send(self, chat: int, html: str, delivery_key: str, reply_to: int | None = None) -> int:
+    async def send(self, chat: int, html: str, delivery_key: str) -> int:
         text, entities = telegram_html.parse(html)
         # Stable per delivery part, including after a process restart.
         random_id = int.from_bytes(hashlib.sha256(delivery_key.encode()).digest()[:8], "big", signed=True)
         try:
             response = await self.client(functions.messages.SendMessageRequest(
                 peer=self.entities[chat], message=text, random_id=random_id, entities=entities,
-                no_webpage=True,
-                reply_to=types.InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to is not None else None))
+                no_webpage=True))
             if isinstance(response, types.UpdateShortSentMessage):
                 return response.id
             for update in getattr(response, "updates", []):
@@ -178,17 +170,10 @@ class UserSender:
         except errors.FloodWaitError as error:
             raise RetryDelivery(error.seconds) from None
         except (errors.MessageIdInvalidError, errors.MsgIdInvalidError):
-            if reply_to is not None:
-                log.warning("Reply target disappeared chat=%s reply_to=%s; sending unthreaded", chat, reply_to)
-                return await self.send(chat, html, delivery_key)
             raise PermanentDelivery from None
         except (errors.ServerError, OSError, asyncio.TimeoutError):
             raise RetryDelivery(5) from None
         except errors.RPCError as error:
-            if reply_to is not None and getattr(error, "message", "") in (
-                    "REPLY_MESSAGE_ID_INVALID", "REPLY_TO_INVALID"):
-                log.warning("Reply target disappeared chat=%s reply_to=%s; sending unthreaded", chat, reply_to)
-                return await self.send(chat, html, delivery_key)
             log.warning("User delivery rejected chat=%s error_type=%s", chat, type(error).__name__)
             raise PermanentDelivery from None
 

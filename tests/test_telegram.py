@@ -183,33 +183,17 @@ async def test_user_sender_never_accepts_unrelated_outgoing_message():
         await UserSender(client, {-10: group()}).send(-10, "test", "key")
 
 
-async def test_aiogram_sender_sets_reply_parameters():
+async def test_aiogram_sender_does_not_reply():
     bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)))
-    await AiogramSender(bot).send(-10, "alert", "key", reply_to=7)
-    parameters = bot.send_message.call_args.kwargs["reply_parameters"]
-    assert parameters.message_id == 7
-    assert parameters.allow_sending_without_reply is True
+    assert await AiogramSender(bot).send(-10, "alert", "key") == 42
+    assert "reply_parameters" not in bot.send_message.call_args.kwargs
 
 
-async def test_aiogram_reply_deleted_between_check_and_send():
-    from aiogram.exceptions import TelegramBadRequest
-    method = SendMessage(chat_id=-10, text="alert")
-    bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
-        TelegramBadRequest(method=method, message="Bad Request: message to be replied not found"),
-        SimpleNamespace(message_id=42)]))
-    assert await AiogramSender(bot).send(-10, "alert", "key", reply_to=7) == 42
-    assert bot.send_message.call_args_list[1].kwargs["reply_parameters"] is None
-
-
-async def test_user_sender_reply_target_and_disappearing_reply():
+async def test_user_sender_does_not_reply():
     client = Client()
-    client.call.side_effect = [errors.MessageIdInvalidError(None),
-                              types.UpdateShortSentMessage(id=77, pts=1, pts_count=1, date=NOW)]
-    assert await UserSender(client, {-10: group()}).send(-10, "alert", "key", reply_to=7) == 77
-    first, second = [call.args[0] for call in client.call.call_args_list]
-    assert first.reply_to.reply_to_msg_id == 7
-    assert second.reply_to is None
-    assert first.random_id == second.random_id
+    client.call.return_value = types.UpdateShortSentMessage(id=77, pts=1, pts_count=1, date=NOW)
+    assert await UserSender(client, {-10: group()}).send(-10, "alert", "key") == 77
+    assert client.call.call_args.args[0].reply_to is None
 
 
 def supergroup(**changes):

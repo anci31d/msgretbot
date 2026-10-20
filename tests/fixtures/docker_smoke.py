@@ -17,8 +17,8 @@ class Sender:
     def __init__(self):
         self.sent = []
 
-    async def send(self, chat, html, delivery_key, reply_to=None):
-        self.sent.append((chat, html, delivery_key, reply_to))
+    async def send(self, chat, html, delivery_key):
+        self.sent.append((chat, html, delivery_key))
         return 1000
 
 
@@ -34,12 +34,11 @@ async def main():
         await service.deletion([4], -10)
         assert await service.deliver_once()
         assert len(sender.sent) == 1
-        assert sender.sent[0][3] == 3
         assert "3." in sender.sent[0][1]
         assert (await (await store.db.execute("PRAGMA journal_mode")).fetchone())[0] == "truncate"
         await store.cleanup(now + TTL + 1)
         assert await store.active(1, -10, now + TTL + 1) == []
-        print("Docker smoke: SQLite + queue + context + reply + TTL OK; no network used")
+        print("Docker smoke: SQLite + queue + context + TTL OK; no network used")
     finally:
         await store.close()
 

@@ -1,11 +1,14 @@
 """Bounded SQLite persistence and transactional notification queue."""
 import asyncio
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict
 import json
 import logging
 import math
 from pathlib import Path
 import sqlite3
+import time
 import aiosqlite
 from .models import Message, TTL
 
@@ -26,6 +29,10 @@ CREATE INDEX IF NOT EXISTS message_lookup ON messages(account, id);
 CREATE TABLE IF NOT EXISTS cooldowns (
  account INTEGER PRIMARY KEY, until REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chat_cooldowns (
+ account INTEGER NOT NULL, chat INTEGER NOT NULL, until REAL NOT NULL,
+ PRIMARY KEY(account, chat)
+);
 CREATE TABLE IF NOT EXISTS deliveries (
  account INTEGER NOT NULL, chat INTEGER NOT NULL, id INTEGER NOT NULL,
  parts TEXT, next_part INTEGER NOT NULL DEFAULT 0, next_at REAL NOT NULL DEFAULT 0,
@@ -33,7 +40,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
  PRIMARY KEY(account, chat, id),
  FOREIGN KEY(account, chat, id) REFERENCES messages(account, chat, id) ON DELETE CASCADE
 );
-PRAGMA user_version=1;
+PRAGMA user_version=2;
 """
 
 
@@ -47,6 +54,7 @@ class Store:
         self.page_size = page_size
         self.page_limit = page_limit
         self.lock = asyncio.Lock()
+        self.pins = Counter()
 
     @classmethod
     async def open(cls, path: Path, max_bytes: int = DATABASE_BYTES):
@@ -77,13 +85,17 @@ class Store:
             await db.execute("PRAGMA synchronous=FULL")
             await db.execute("PRAGMA foreign_keys=ON")
             row = await (await db.execute("PRAGMA user_version")).fetchone()
-            if row[0] > 1:
+            if row[0] > 2:
                 raise ValueError("Database schema is newer than this application")
-            await db.executescript(SCHEMA)
             store = cls(db, page_size, page_limit)
+            if row[0] == 1:
+                # A full v1 database needs room before adding the pacing table.
+                async with store.lock:
+                    await store._make_room(32 * 1024)
+            await db.executescript(SCHEMA)
             async with store.lock:
                 await store._make_room(32 * 1024)
-            log.info("Database opened schema=1 journal=TRUNCATE total_budget=%s main_limit=%s",
+            log.info("Database opened schema=2 journal=TRUNCATE total_budget=%s main_limit=%s",
                      max_bytes, page_limit * page_size)
             return store
         except BaseException:
@@ -101,11 +113,33 @@ class Store:
     def key(message: Message):
         return message.account, message.chat, message.id
 
+    def pin(self, key):
+        self.pins[key] += 1
+
+    def unpin(self, key):
+        self.pins[key] -= 1
+        if self.pins[key] <= 0:
+            del self.pins[key]
+
+    @contextmanager
+    def protect(self, keys):
+        keys = tuple(keys)
+        self.pins.update(keys)
+        try:
+            yield
+        finally:
+            for key in keys:
+                self.unpin(key)
+
     async def _evict_oldest(self, protected=None) -> int:
         restriction, params = "", []
+        keys = set(self.pins)
         if protected is not None:
-            restriction = " WHERE NOT (account=? AND chat=? AND id=?)"
-            params.extend(protected)
+            keys.add(protected)
+        if keys:
+            restriction = " WHERE NOT (" + " OR ".join(
+                "(account=? AND chat=? AND id=?)" for _ in keys) + ")"
+            params = [value for key in keys for value in key]
         await self.db.execute("BEGIN IMMEDIATE")
         try:
             removed = await self.db.execute("""DELETE FROM messages WHERE rowid IN
@@ -181,14 +215,23 @@ class Store:
         async with self.lock:
             removed = await self.db.execute("DELETE FROM messages WHERE sent_at<=?", (now - TTL,))
             await self.db.execute("DELETE FROM cooldowns WHERE until<=?", (now,))
+            await self.db.execute("DELETE FROM chat_cooldowns WHERE until<=?", (now,))
             if removed.rowcount:
                 log.info("Expired messages purged count=%s; related deliveries removed", removed.rowcount)
             else:
                 log.debug("Expiry cleanup completed count=0")
 
     async def active(self, account: int, chat: int, now: float) -> list[Message]:
-        rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
-            AND sent_at>? AND deleted=0 AND own_alert=0 ORDER BY id""", (account, chat, now-TTL))).fetchall()
+        async with self.lock:
+            rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
+                AND sent_at>? AND deleted=0 AND own_alert=0 ORDER BY id""", (account, chat, now-TTL))).fetchall()
+        return [self.message(row) for row in rows]
+
+    async def active_batch(self, account: int, chat: int, now: float, after: int):
+        async with self.lock:
+            rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
+                AND id>? AND sent_at>? AND deleted=0 AND own_alert=0 ORDER BY id LIMIT 100""",
+                (account, chat, after, now-TTL))).fetchall()
         return [self.message(row) for row in rows]
 
     async def matching(self, account: int, ids: list[int], now: float) -> list[Message]:
@@ -198,51 +241,99 @@ class Store:
             if not batch:
                 continue
             marks = ",".join("?" for _ in batch)
-            rows = await (await self.db.execute(f"""SELECT * FROM messages WHERE account=?
-                AND sent_at>? AND deleted=0 AND id IN ({marks})""", (account, now-TTL, *batch))).fetchall()
+            async with self.lock:
+                rows = await (await self.db.execute(f"""SELECT * FROM messages WHERE account=?
+                    AND sent_at>? AND deleted=0 AND id IN ({marks})""", (account, now-TTL, *batch))).fetchall()
             found.extend(self.message(row) for row in rows)
         return found
 
     async def deleted(self, message: Message, now: float):
+        await self.deleted_many([message], now)
+
+    async def deleted_many(self, messages: list[Message], now: float):
+        if not messages:
+            return
+        if len(messages) > 100:
+            raise ValueError("Deletion transactions accept at most 100 messages")
+        started = time.monotonic()
+        keys = tuple(dict.fromkeys(self.key(message) for message in messages))
+        marks = ",".join("(?,?,?)" for _ in keys)
+        params = tuple(value for key in keys for value in key)
         async def operation():
-            key = self.key(message)
-            await self.db.execute("""UPDATE messages SET deleted=1
-                WHERE account=? AND chat=? AND id=? AND sent_at>?""", (*key, now-TTL))
-            queued = await self.db.execute("""INSERT OR IGNORE INTO deliveries(account,chat,id)
-                SELECT account,chat,id FROM messages WHERE account=? AND chat=? AND id=?
+            await self.db.execute(f"""UPDATE messages SET deleted=1
+                WHERE (account,chat,id) IN ({marks}) AND sent_at>?""", (*params, now-TTL))
+            queued = await self.db.execute(f"""INSERT OR IGNORE INTO deliveries(account,chat,id)
+                SELECT account,chat,id FROM messages WHERE (account,chat,id) IN ({marks})
                 AND deleted=1 AND sent_at>? AND kind='text' AND text IS NOT NULL AND own_alert=0""",
-                (*key, now-TTL))
-            return bool(queued.rowcount)
-        queued = await self._write(operation, self.key(message))
-        log.info("Message deletion recorded account=%s chat=%s message=%s queued=%s",
-                 message.account, message.chat, message.id, queued)
+                (*params, now-TTL))
+            return queued.rowcount
+        with self.protect(keys):
+            queued = await self._write(operation)
+        log.info("Message deletion recorded batch=%s queued=%s elapsed_seconds=%.3f",
+                 len(keys), queued, time.monotonic()-started)
+        for account, chat, mid in keys:
+            log.debug("Deletion batch member account=%s chat=%s message=%s", account, chat, mid)
 
     async def candidates(self, original: Message, now: float) -> list[Message]:
-        rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
-            AND id<? AND sent_at>? AND deleted=0 AND own_alert=0 AND kind='text'
-            AND text IS NOT NULL AND author IS NOT NULL ORDER BY id DESC LIMIT 10""",
-            (original.account, original.chat, original.id, now-TTL))).fetchall()
+        async with self.lock:
+            rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
+                AND id<? AND sent_at>? AND own_alert=0 AND kind='text'
+                AND text IS NOT NULL ORDER BY id DESC LIMIT 10""",
+                (original.account, original.chat, original.id, now-TTL))).fetchall()
         return [self.message(row) for row in rows]
 
-    async def preceding(self, original: Message, now: float) -> list[Message]:
-        rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
-            AND id<? AND sent_at>? AND deleted=0 AND own_alert=0 AND kind!='service'
-            ORDER BY id DESC""", (original.account, original.chat, original.id, now-TTL))).fetchall()
-        return [self.message(row) for row in rows]
-
-    async def due(self, account: int, now: float, groups=None):
-        params = [account, now, now-TTL, now]
+    async def due(self, account: int, now: float, groups=None, *, pin=False):
+        params = [account, now, now-TTL, now, now]
         restriction = ""
         if groups is not None:
             if not groups:
                 return None
             restriction = " AND d.chat IN (" + ",".join("?" for _ in groups) + ")"
             params.extend(groups)
-        return await (await self.db.execute("""SELECT m.*,d.parts,d.next_part FROM deliveries d
-            JOIN messages m USING(account,chat,id) WHERE d.account=? AND d.done=0
-            AND d.next_at<=? AND m.sent_at>?
-            AND COALESCE((SELECT until FROM cooldowns WHERE account=d.account),0)<=?"""
-            + restriction + " ORDER BY m.sent_at,m.id LIMIT 1", params)).fetchone()
+        async with self.lock:
+            row = await (await self.db.execute("""SELECT m.*,d.parts,d.next_part FROM deliveries d
+                JOIN messages m USING(account,chat,id) WHERE d.account=? AND d.done=0
+                AND d.next_at<=? AND m.sent_at>?
+                AND COALESCE((SELECT until FROM cooldowns WHERE account=d.account),0)<=?
+                AND COALESCE((SELECT until FROM chat_cooldowns
+                    WHERE account=d.account AND chat=d.chat),0)<=?"""
+                + restriction + " ORDER BY m.sent_at,m.id,m.chat LIMIT 1", params)).fetchone()
+            if row is not None and pin:
+                self.pin((row["account"], row["chat"], row["id"]))
+            return row
+
+    async def pending_count(self, account: int, now: float):
+        async with self.lock:
+            row = await (await self.db.execute("""SELECT count(*) FROM deliveries d
+                JOIN messages m USING(account,chat,id)
+                WHERE d.account=? AND d.done=0 AND m.sent_at>?""", (account, now-TTL))).fetchone()
+        return row[0]
+
+    async def reserve_send(self, message: Message, part: int, now: float) -> bool:
+        """Persist pacing before a network attempt; a restart must not bypass it."""
+        async def operation():
+            eligible = await (await self.db.execute("""SELECT 1 FROM deliveries d
+                JOIN messages m USING(account,chat,id)
+                WHERE d.account=? AND d.chat=? AND d.id=? AND d.done=0 AND d.next_part=?
+                AND d.next_at<=? AND m.sent_at>?
+                AND COALESCE((SELECT until FROM cooldowns WHERE account=d.account),0)<=?
+                AND COALESCE((SELECT until FROM chat_cooldowns
+                    WHERE account=d.account AND chat=d.chat),0)<=?""",
+                (*self.key(message), part, now, now-TTL, now, now))).fetchone()
+            if eligible is None:
+                return False
+            await self.db.execute("""INSERT INTO cooldowns(account,until) VALUES(?,?)
+                ON CONFLICT(account) DO UPDATE SET until=MAX(until,excluded.until)""",
+                (message.account, now+1))
+            await self.db.execute("""INSERT INTO chat_cooldowns(account,chat,until) VALUES(?,?,?)
+                ON CONFLICT(account,chat) DO UPDATE SET until=MAX(until,excluded.until)""",
+                (message.account, message.chat, now+3))
+            return True
+        reserved = await self._write(operation, self.key(message))
+        if reserved:
+            log.debug("Delivery pacing reserved account=%s chat=%s global_until=%s chat_until=%s",
+                      message.account, message.chat, now+1, now+3)
+        return reserved
 
     async def prepare(self, message: Message, parts: list[str]):
         payload = json.dumps(parts)
@@ -252,10 +343,11 @@ class Store:
         await self._write(operation, self.key(message), reserve=len(payload.encode()) + 32 * 1024)
 
     async def pending_parts(self, account: int, chat: int, now: float) -> list[str]:
-        rows = await (await self.db.execute("""SELECT d.parts FROM deliveries d
-            JOIN messages m USING(account,chat,id) WHERE d.account=? AND d.chat=?
-            AND d.done=0 AND d.parts IS NOT NULL AND m.sent_at>?""",
-            (account, chat, now-TTL))).fetchall()
+        async with self.lock:
+            rows = await (await self.db.execute("""SELECT d.parts FROM deliveries d
+                JOIN messages m USING(account,chat,id) WHERE d.account=? AND d.chat=?
+                AND d.done=0 AND d.parts IS NOT NULL AND m.sent_at>?""",
+                (account, chat, now-TTL))).fetchall()
         return [part for row in rows for part in json.loads(row["parts"])]
 
     async def postpone(self, message: Message, until: float, global_delay: bool = False):

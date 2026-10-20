@@ -25,6 +25,7 @@ async def test_batch_delete_without_chat_and_dedup(setup, message):
     await setup.service.deletion([10, 11, 999])
     await setup.service.deletion([10, 11])
     assert await setup.service.deliver_once()
+    setup.clock[0] += 1
     assert await setup.service.deliver_once()
     assert not await setup.service.deliver_once()
     assert {call[0] for call in setup.sender.calls} == {-10, -20}
@@ -37,14 +38,14 @@ async def test_chat_scoped_deletion(setup, message):
     assert not await setup.service.deliver_once()
 
 
-async def test_context_different_authors_and_presence(setup, message):
+async def test_context_uses_saved_messages_without_presence_checks(setup, message):
     for mid, author in [(1, 30), (2, 31), (3, 20), (4, 20), (5, 32), (6, 33)]:
         await setup.service.record(message(mid, author=author, text=f"text-{mid}"))
     setup.reader.states.update({5: Presence.DELETED, 6: Presence.UNKNOWN})
     context = await setup.service.context(message())
-    assert [m.id for m in context] == [4, 2, 1]
-    assert len({m.author for m in context}) == 3
-    assert await setup.store.due(1, NOW) is not None  # Deleted context is also recovered.
+    assert [m.id for m in context] == [1, 2, 3, 4, 5, 6]
+    assert setup.reader.requests == []
+    assert await setup.store.due(1, NOW) is None
 
 
 async def test_unknown_not_deleted_on_reconciliation(setup, message):
@@ -104,9 +105,13 @@ async def test_restart_resumes_next_part(setup, message):
     await setup.service.deliver_once()
     other = await Store.open(setup.path)
     try:
-        resumed = Recovery(other, setup.reader, setup.sender, 1, (-10,), 99, clock=lambda: NOW)
-        while await resumed.deliver_once():
-            pass
+        resumed = Recovery(other, setup.reader, setup.sender, 1, (-10,), 99,
+                           clock=lambda: setup.clock[0])
+        assert not await resumed.deliver_once()
+        for _ in range(2):
+            setup.clock[0] += 3
+            assert await resumed.deliver_once()
+        assert not await resumed.deliver_once()
     finally:
         await other.close()
     calls = setup.sender.calls
@@ -131,7 +136,7 @@ async def test_account_isolation(setup, message):
 
 async def test_sqlite_migration_version(setup):
     row = await (await setup.store.db.execute("PRAGMA user_version")).fetchone()
-    assert row[0] == 1
+    assert row[0] == 2
     row = await (await setup.store.db.execute("PRAGMA journal_mode")).fetchone()
     assert row[0] == "truncate"
 
@@ -186,26 +191,25 @@ async def test_pending_alert_never_sent_to_removed_group(setup, message):
     assert setup.sender.calls == []
 
 
-async def test_context_three_messages_from_one_author(setup, message):
+async def test_context_multiple_messages_from_one_author(setup, message):
     for mid in range(1, 5):
         await setup.service.record(message(mid))
     context = await setup.service.context(message())
-    assert [item.id for item in context] == [4, 3, 2]
+    assert [item.id for item in context] == [1, 2, 3, 4]
 
 
 async def test_context_two_authors_fills_nearest_extra_message(setup, message):
     for mid, author in [(1, 30), (2, 20), (3, 20), (4, 20)]:
         await setup.service.record(message(mid, author=author))
-    assert [item.id for item in await setup.service.context(message())] == [4, 3, 1]
+    assert [item.id for item in await setup.service.context(message())] == [1, 2, 3, 4]
 
 
 async def test_context_does_not_search_beyond_ten_texts(setup, message):
     for mid in range(1, 13):
         await setup.service.record(message(mid, author=30 if mid == 1 else 20))
     result = await setup.service.context(message(13))
-    assert [item.id for item in result] == [12, 11, 10]
-    assert len(setup.reader.requests[-1][1]) == 10
-    assert 1 not in setup.reader.requests[-1][1]
+    assert [item.id for item in result] == list(range(3, 13))
+    assert setup.reader.requests == []
 
 
 async def test_media_does_not_consume_text_context_window(setup, message):
@@ -213,31 +217,17 @@ async def test_media_does_not_consume_text_context_window(setup, message):
     for mid in range(2, 20):
         await setup.service.record(message(mid, kind="photo", text=None))
     await setup.service.record(message(20, author=20))
-    assert [item.id for item in await setup.service.context(message(21))] == [20, 1]
+    assert [item.id for item in await setup.service.context(message(21))] == [1, 20]
 
 
-async def test_reply_is_nearest_previous_message_including_media(setup, message):
+async def test_delivery_does_not_lookup_reply_targets(setup, message):
     await setup.service.record(message(8))
     await setup.service.record(message(9, kind="photo", text=None))
     await setup.service.record(message())
     await setup.service.deletion([10])
-    await setup.service.deliver_once()
-    assert setup.sender.calls[0][3] == 9
-
-
-async def test_reply_skips_deleted_unknown_and_own_alerts(setup, message):
-    for mid in range(1, 5):
-        await setup.service.record(message(mid))
-    await setup.service.record(message(5, author=99))
-    setup.reader.states.update({4: Presence.UNKNOWN, 3: Presence.DELETED})
-    assert await setup.service.reply_target(message()) == 2
-
-
-async def test_reply_absent_when_no_confirmed_predecessor(setup, message):
-    await setup.service.record(message())
-    await setup.service.deletion([10])
-    await setup.service.deliver_once()
-    assert setup.sender.calls[0][3] is None
+    assert await setup.service.deliver_once()
+    assert setup.reader.requests == []
+    assert len(setup.sender.calls[0]) == 3
 
 
 async def test_operational_logs_exclude_message_contents(setup, message, caplog):
@@ -257,7 +247,7 @@ async def test_operational_logs_exclude_message_contents(setup, message, caplog)
 async def test_supergroup_deletions_do_not_cross_chat_id_spaces(setup, message):
     first, second = -1000000000100, -1000000000200
     service = Recovery(setup.store, setup.reader, setup.sender, 1,
-                       (-10, first, second), 99, clock=lambda: NOW)
+                       (-10, first, second), 99, clock=lambda: setup.clock[0])
     for chat in (-10, first, second):
         await service.record(message(10, chat=chat))
     await service.deletion([10])
@@ -265,9 +255,24 @@ async def test_supergroup_deletions_do_not_cross_chat_id_spaces(setup, message):
     assert setup.sender.calls[-1][0] == -10
     assert not await service.deliver_once()
     await service.deletion([10], first)
+    setup.clock[0] += 1
     assert await service.deliver_once()
     assert setup.sender.calls[-1][0] == first
     assert [m.id for m in await setup.store.active(1, second, NOW)] == [10]
     await service.deletion([10], second)
+    setup.clock[0] += 1
     assert await service.deliver_once()
     assert setup.sender.calls[-1][0] == second
+
+
+async def test_context_includes_deleted_texts_and_unknown_authors_but_is_scoped(setup, message):
+    await setup.service.record(message(1))
+    await setup.service.deletion([1], -10)
+    await setup.service.record(message(2, author=None, username=None))
+    await setup.service.record(message(3, chat=-20))
+    await setup.store.save(message(4, account=2), NOW)
+    await setup.service.record(message(5, sent_at=NOW-TTL+1))
+    setup.clock[0] += 1
+    context = await setup.service.context(message(10))
+    assert [item.id for item in context] == [1, 2]
+    assert setup.reader.requests == []

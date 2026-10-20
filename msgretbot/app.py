@@ -18,6 +18,29 @@ from .telegram import AiogramSender, TelegramReader, UserSender, normalize
 log = logging.getLogger(__name__)
 
 
+async def enqueue_event(queue, event):
+    if queue.full():
+        log.warning("Event queue full backlog=%s; applying backpressure", queue.qsize())
+    await queue.put(event)
+    log.debug("Event queued kind=%s backlog=%s", event[0], queue.qsize())
+
+
+async def enqueue_deletions(queue, ids, chat):
+    for offset in range(0, len(ids), 100):
+        await enqueue_event(queue, ("deleted", (ids[offset:offset+100], chat)))
+
+
+async def monitor_reconciliation(client, service, queue=None):
+    """Also cover reconnects too short to observe through connection state."""
+    while True:
+        await asyncio.sleep(30)
+        if client.is_connected():
+            await service.reconcile()
+        if queue is not None:
+            log.info("Recovery load events=%s pending=%s", queue.qsize(),
+                     await service.store.pending_count(service.account, service.clock()))
+
+
 async def run(config: Config, command: str):
     log.info("Application starting command=%s mode=%s groups=%s", command, config.mode, len(config.groups))
     # Restrict session/database files created by SQLite and Telethon.
@@ -32,7 +55,7 @@ async def run(config: Config, command: str):
     client = TelegramClient(str(config.session), config.api_id, config.api_hash,
                             flood_sleep_threshold=0, sequential_updates=True)
     store = sender = None
-    queue = asyncio.Queue()
+    queue = asyncio.Queue(maxsize=1000)
     tasks = []
     try:
         if command == "login":
@@ -66,14 +89,14 @@ async def run(config: Config, command: str):
 
         async def on_message(event):
             if event.chat_id in service.groups:
-                await queue.put(("message", normalize(event.message, me.id, event.chat_id)))
+                await enqueue_event(queue, ("message", normalize(event.message, me.id, event.chat_id)))
                 log.debug("Message event queued chat=%s message=%s backlog=%s", event.chat_id,
                           event.message.id, queue.qsize())
 
         async def on_deleted(event):
             # For supergroups Telegram supplies the channel peer in chat_id.
             if event.chat_id is None or event.chat_id in service.groups:
-                await queue.put(("deleted", (event.deleted_ids, event.chat_id)))
+                await enqueue_deletions(queue, event.deleted_ids, event.chat_id)
 
         client.add_event_handler(on_message, events.NewMessage())
         client.add_event_handler(on_message, events.MessageEdited())
@@ -103,15 +126,8 @@ async def run(config: Config, command: str):
         tasks.remove(joined)
         await service.reconcile()
 
-        async def monitor():
-            # Also covers reconnects too short to observe via connection-state polling.
-            while True:
-                await asyncio.sleep(60)
-                if client.is_connected():
-                    await service.reconcile()
-
         tasks.extend([asyncio.create_task(service.worker()),
-                      asyncio.create_task(monitor()),
+                      asyncio.create_task(monitor_reconciliation(client, service, queue)),
                       asyncio.create_task(client.run_until_disconnected())])
         log.info("Recovery service started mode=%s groups=%s", config.mode, len(config.groups))
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

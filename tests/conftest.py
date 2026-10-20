@@ -24,10 +24,10 @@ class Sender:
         self.calls = []
         self.error = None
 
-    async def send(self, chat, html, key, reply_to=None):
+    async def send(self, chat, html, key):
         if self.error:
             raise self.error
-        self.calls.append((chat, html, key, reply_to))
+        self.calls.append((chat, html, key))
         return 5000 + len(self.calls)
 
 

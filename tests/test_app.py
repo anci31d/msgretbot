@@ -74,3 +74,17 @@ async def test_graceful_termination_closes_application_resources(tmp_path, monke
     task.cancel()
     await task
     assert closed.is_set()
+
+
+async def test_reconciliation_polls_every_thirty_seconds_and_skips_disconnect(monkeypatch):
+    import asyncio
+    from unittest.mock import Mock
+    from msgretbot.app import monitor_reconciliation
+    client = SimpleNamespace(is_connected=Mock(side_effect=[False, True]))
+    service = SimpleNamespace(reconcile=AsyncMock())
+    sleep = AsyncMock(side_effect=[None, None, asyncio.CancelledError()])
+    monkeypatch.setattr("msgretbot.app.asyncio.sleep", sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await monitor_reconciliation(client, service)
+    assert [call.args for call in sleep.call_args_list] == [(30,), (30,), (30,)]
+    service.reconcile.assert_awaited_once()
