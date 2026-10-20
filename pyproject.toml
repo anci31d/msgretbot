@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "msgretbot"
+version = "0.1.0"
+description = "Restore deleted text messages in explicitly configured Telegram groups"
+requires-python = ">=3.12"
+dependencies = ["aiogram>=3.20,<4", "Telethon>=1.40,<2", "aiosqlite>=0.21,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+
+[project.scripts]
+msgretbot = "msgretbot.app:main"
+
+[tool.setuptools.packages.find]
+include = ["msgretbot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

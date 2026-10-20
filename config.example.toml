@@ -1,0 +1,9 @@
+mode = "userbot" # "hybrid" or "userbot"
+groups = [-123456789] # Basic groups only; replace with actual numeric IDs.
+database = "data/messages.sqlite3"
+session = "data/observer.session"
+
+[logging]
+output = "stdout" # "stdout" or "file"
+level = "INFO" # "DEBUG" for context and reconciliation details
+file = "logs/msgretbot.log" # 5 MiB current + 5 MiB archive
