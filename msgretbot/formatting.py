@@ -1,4 +1,5 @@
 """Safe Telegram HTML, sized by UTF-16 code units."""
+
 from html import escape
 from html.parser import HTMLParser
 from .models import Message
@@ -6,6 +7,7 @@ from .models import Message
 
 def plain_text(html: str) -> str:
     """Extract the visible payload to recognize outgoing alerts after a lost ACK."""
+
     class Text(HTMLParser):
         def __init__(self):
             super().__init__(convert_charrefs=True)
@@ -48,6 +50,7 @@ def author(message: Message) -> str:
 
 class QuoteContext:
     """Basic groups have no standard message permalinks."""
+
     def render(self, messages: list[Message]) -> str:
         if not messages:
             return "Контекст отсутствует"
@@ -61,7 +64,7 @@ class QuoteContext:
 
 def render(message: Message, context: list[Message], formatter=None) -> list[str]:
     formatter = formatter or QuoteContext()
-    header = f"!!! ШИФРУН АЛЕРТ !!!\nСообщение {author(message)} удалено:\n"
+    header = f"!!! 1984 АЛЕРТ !!!\nСообщение {author(message)} удалено:\n"
     # Reserve enough space even for names and quotes made entirely of astral emoji.
     texts = chunks(message.text or "", 2100)
     parts = [header + "<pre>" + escape(text) + "</pre>" for text in texts]
