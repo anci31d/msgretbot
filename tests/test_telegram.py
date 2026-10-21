@@ -109,11 +109,43 @@ def test_media_normalization():
     assert normalize(raw(), 1, -10).text == "text"
     normalized = normalize(raw(media=object(), photo=object(), message="caption"), 1, -10)
     assert normalized.kind == "photo"
-    assert normalized.text is None
+    assert normalized.text == "caption"
     document = SimpleNamespace(attributes=[types.DocumentAttributeAudio(duration=1, voice=True)])
     assert normalize(raw(media=object(), document=document), 1, -10).kind == "voice"
     preview = types.MessageMediaWebPage(webpage=types.WebPageEmpty(id=1))
     assert normalize(raw(media=preview), 1, -10).kind == "text"
+
+
+@pytest.mark.parametrize("attributes", [
+    [], [types.DocumentAttributeVideo(duration=1, w=10, h=10)],
+    [types.DocumentAttributeAudio(duration=1)],
+    [types.DocumentAttributeAudio(duration=1, voice=True)],
+    [types.DocumentAttributeAnimated()],
+])
+def test_document_captions_are_preserved(attributes):
+    document = SimpleNamespace(attributes=attributes)
+    saved = normalize(raw(media=object(), document=document, message="<caption> 😀"), 1, -10)
+    assert saved.text == "<caption> 😀"
+    assert normalize(raw(media=object(), document=document, message=""), 1, -10).text is None
+
+
+def test_structured_media_visible_text():
+    poll = types.MessageMediaPoll(
+        poll=SimpleNamespace(question=types.TextWithEntities("Question?", []),
+                             answers=[SimpleNamespace(text=types.TextWithEntities("Yes", [])),
+                                      SimpleNamespace(text="No")]), results=types.PollResults())
+    contact = types.MessageMediaContact("+123", "Alice", "Smith", "PRIVATE VCARD", 20)
+    venue = types.MessageMediaVenue(types.GeoPointEmpty(), "Place", "Street", "", "", "")
+    game = types.MessageMediaGame(SimpleNamespace(title="Game", description="Description"))
+    invoice = types.MessageMediaInvoice("Order", "Details", "USD", 100, "private-param")
+    for media, expected in [(poll, "Опрос: Question?\n1. Yes\n2. No"),
+                            (contact, "Контакт: Alice Smith\n+123"),
+                            (venue, "Place\nStreet"), (game, "Game\nDescription"),
+                            (invoice, "Order\nDetails")]:
+        assert normalize(raw(media=media, message=""), 1, -10).text == expected
+    assert normalize(raw(media=poll, message="Caption"), 1, -10).text.startswith("Caption\nОпрос:")
+    assert normalize(raw(media=object(), message=""), 1, -10).text is None
+    assert normalize(raw(action=object(), message="service text"), 1, -10).text is None
 
 
 async def test_bootstrap_limit_and_ttl(setup):

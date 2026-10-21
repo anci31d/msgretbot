@@ -13,6 +13,30 @@ from .models import Message, Presence, RetryDelivery, PermanentDelivery
 log = logging.getLogger(__name__)
 
 
+def extract_text(raw) -> str | None:
+    """Read captions and structured visible text without downloading attachments."""
+    if raw.action:
+        return None
+    parts = [raw.message] if raw.message else []
+    media = raw.media
+    if isinstance(media, types.MessageMediaPoll):
+        def text(value):
+            return value if isinstance(value, str) else value.text
+        parts.append("Опрос: " + text(media.poll.question))
+        parts.extend(f"{index}. {text(answer.text)}"
+                     for index, answer in enumerate(media.poll.answers, 1))
+    elif isinstance(media, types.MessageMediaContact):
+        parts.extend(["Контакт: " + " ".join(filter(None, (media.first_name, media.last_name))),
+                      media.phone_number])
+    elif isinstance(media, types.MessageMediaVenue):
+        parts.extend([media.title, media.address])
+    elif isinstance(media, types.MessageMediaGame):
+        parts.extend([media.game.title, media.game.description])
+    elif isinstance(media, types.MessageMediaInvoice):
+        parts.extend([media.title, media.description])
+    return "\n".join(part for part in parts if part) or None
+
+
 def normalize(raw, account: int, chat: int) -> Message:
     user = raw.sender
     name = " ".join(filter(None, (getattr(user, "first_name", None),
@@ -39,7 +63,7 @@ def normalize(raw, account: int, chat: int) -> Message:
     if isinstance(raw.media, types.MessageMediaWebPage):
         kind = "text"
     return Message(account, chat, raw.id, raw.sender_id, name, getattr(user, "username", None),
-                   raw.date.timestamp(), raw.message if kind == "text" else None, kind,
+                   raw.date.timestamp(), extract_text(raw), kind,
                    revision_at=(raw.edit_date or raw.date).timestamp())
 
 

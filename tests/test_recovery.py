@@ -7,7 +7,7 @@ from msgretbot.storage import Store
 from conftest import NOW
 
 
-async def test_filters_and_last_revision(setup, message):
+async def test_filters_and_first_saved_revision(setup, message):
     for change in ({"chat": -30}, {"account": 2}, {"sent_at": NOW-TTL}):
         await setup.service.record(message(**change))
     assert await setup.store.active(1, -10, NOW) == []
@@ -15,7 +15,8 @@ async def test_filters_and_last_revision(setup, message):
     await setup.service.record(message(text="edited", revision_at=200))
     await setup.service.record(message(text="stale history", revision_at=100))
     saved = (await setup.store.active(1, -10, NOW))[0]
-    assert saved.text == "edited"
+    assert saved.text == "original"
+    assert saved.revision_at == 100
     assert saved.sent_at == NOW-100
 
 
@@ -276,3 +277,49 @@ async def test_context_includes_deleted_texts_and_unknown_authors_but_is_scoped(
     context = await setup.service.context(message(10))
     assert [item.id for item in context] == [1, 2]
     assert setup.reader.requests == []
+
+
+@pytest.mark.parametrize("kind", ["photo", "video", "audio", "voice", "document", "media"])
+async def test_media_text_is_context_and_recoverable_after_edit(setup, message, kind):
+    await setup.service.record(message(1, kind=kind, text="caption", revision_at=1))
+    assert [item.text for item in await setup.service.context(message(2))] == ["caption"]
+    await setup.service.record(message(1, kind=kind, text="edited <caption>", revision_at=2))
+    await setup.service.deletion([1], -10)
+    assert await setup.service.deliver_once()
+    assert "<pre>caption</pre>" in setup.sender.calls[0][1]
+    assert "edited" not in setup.sender.calls[0][1]
+    assert [item.text for item in await setup.service.context(message(2))] == ["caption"]
+
+
+async def test_removed_caption_keeps_first_version_and_service_is_excluded(setup, message):
+    await setup.service.record(message(1, kind="photo", text="caption", revision_at=1))
+    await setup.service.record(message(1, kind="photo", text=None, revision_at=2))
+    await setup.service.record(message(2, kind="service", text="service"))
+    await setup.service.record(message(3, kind="media", text=""))
+    assert [item.text for item in await setup.service.context(message(4))] == ["caption"]
+    await setup.service.deletion([1, 2, 3], -10)
+    assert await setup.service.deliver_once()
+    assert "<pre>caption</pre>" in setup.sender.calls[0][1]
+    assert await setup.store.pending_count(1, setup.clock[0]) == 0
+
+
+async def test_first_version_survives_reopen_and_later_history(setup, message):
+    await setup.service.record(message(text="first", revision_at=10))
+    other = await Store.open(setup.path)
+    try:
+        await other.save(message(text="later", revision_at=20), NOW)
+        await other.save(message(text="older fetched history", revision_at=1), NOW)
+        assert (await other.active(1, -10, NOW))[0].text == "first"
+    finally:
+        await other.close()
+    await setup.service.deletion([10], -10)
+    assert await setup.service.deliver_once()
+    assert "<pre>first</pre>" in setup.sender.calls[0][1]
+
+
+async def test_caption_added_later_does_not_replace_initial_empty_version(setup, message):
+    await setup.service.record(message(kind="photo", text=None))
+    await setup.service.record(message(kind="photo", text="added", revision_at=20))
+    assert await setup.service.context(message(11)) == []
+    await setup.service.deletion([10], -10)
+    assert not await setup.service.deliver_once()

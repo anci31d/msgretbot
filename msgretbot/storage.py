@@ -194,12 +194,15 @@ class Store:
                 INSERT INTO messages(account,chat,id,author,name,username,sent_at,text,kind,own_alert,revision_at)
                 VALUES(:account,:chat,:id,:author,:name,:username,:sent_at,:text,:kind,:own_alert,:revision_at)
                 ON CONFLICT(account,chat,id) DO UPDATE SET
-                  author=excluded.author,name=excluded.name,username=excluded.username,
-                  text=CASE WHEN excluded.revision_at>=messages.revision_at THEN excluded.text ELSE messages.text END,
-                  kind=CASE WHEN excluded.revision_at>=messages.revision_at THEN excluded.kind ELSE messages.kind END,
-                  revision_at=MAX(messages.revision_at,excluded.revision_at),
                   own_alert=MAX(messages.own_alert,excluded.own_alert)
                 """, values)
+        async with self.lock:
+            existing = await (await self.db.execute(
+                "SELECT own_alert FROM messages WHERE account=? AND chat=? AND id=?",
+                self.key(message))).fetchone()
+        if existing is not None and (existing[0] or not message.own_alert):
+            log.debug("Existing message version retained chat=%s message=%s", message.chat, message.id)
+            return True
         payload_bytes = sum(len(value.encode("utf-8")) for value in values.values() if isinstance(value, str))
         try:
             await self._write(operation, self.key(message), reserve=payload_bytes + 32 * 1024)
@@ -264,7 +267,8 @@ class Store:
                 WHERE (account,chat,id) IN ({marks}) AND sent_at>?""", (*params, now-TTL))
             queued = await self.db.execute(f"""INSERT OR IGNORE INTO deliveries(account,chat,id)
                 SELECT account,chat,id FROM messages WHERE (account,chat,id) IN ({marks})
-                AND deleted=1 AND sent_at>? AND kind='text' AND text IS NOT NULL AND own_alert=0""",
+                AND deleted=1 AND sent_at>? AND kind!='service'
+                AND text IS NOT NULL AND text!='' AND own_alert=0""",
                 (*params, now-TTL))
             return queued.rowcount
         with self.protect(keys):
@@ -277,8 +281,8 @@ class Store:
     async def candidates(self, original: Message, now: float) -> list[Message]:
         async with self.lock:
             rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
-                AND id<? AND sent_at>? AND own_alert=0 AND kind='text'
-                AND text IS NOT NULL ORDER BY id DESC LIMIT 10""",
+                AND id<? AND sent_at>? AND own_alert=0 AND kind!='service'
+                AND text IS NOT NULL AND text!='' ORDER BY id DESC LIMIT 10""",
                 (original.account, original.chat, original.id, now-TTL))).fetchall()
         return [self.message(row) for row in rows]
 
