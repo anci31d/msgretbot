@@ -4,7 +4,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import pytest
-from msgretbot.app import run
+from msgretbot.app import initialize_recovery, run
 from msgretbot.config import Config
 
 
@@ -88,3 +88,41 @@ async def test_reconciliation_polls_every_thirty_seconds_and_skips_disconnect(mo
         await monitor_reconciliation(client, service)
     assert [call.args for call in sleep.call_args_list] == [(30,), (30,), (30,)]
     service.reconcile.assert_awaited_once()
+
+
+async def test_pending_alert_is_delivered_while_bootstrap_is_blocked(setup, message):
+    import asyncio
+
+    delivered = asyncio.Event()
+    original_send = setup.sender.send
+
+    async def send_and_signal(chat, html, key):
+        result = await original_send(chat, html, key)
+        delivered.set()
+        return result
+
+    setup.sender.send = send_and_signal
+    await setup.service.record(message())
+    await setup.service.deletion([10], -10)
+
+    class Reader:
+        async def bootstrap(self, service):
+            await asyncio.wait_for(delivered.wait(), timeout=3)
+
+    queue = asyncio.Queue()
+
+    async def consume():
+        while True:
+            await queue.get()
+            queue.task_done()
+
+    client = SimpleNamespace(catch_up=AsyncMock())
+    tasks = []
+    try:
+        await initialize_recovery(Reader(), setup.service, client, queue, consume, tasks, "userbot")
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert len(setup.sender.calls) == 1

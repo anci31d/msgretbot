@@ -41,6 +41,22 @@ async def monitor_reconciliation(client, service, queue=None):
                      await service.store.pending_count(service.account, service.clock()))
 
 
+async def initialize_recovery(reader, service, client, queue, consume, tasks, mode):
+    """Start ingestion and delivery before startup history checks can be rate limited."""
+    consumer = asyncio.create_task(consume())
+    tasks.extend((consumer, asyncio.create_task(service.worker())))
+    log.info("Recovery service started mode=%s groups=%s", mode, len(service.groups))
+    await reader.bootstrap(service)
+    await client.catch_up()
+    joined = asyncio.create_task(queue.join())
+    tasks.append(joined)
+    done, _ = await asyncio.wait((joined, consumer), return_when=asyncio.FIRST_COMPLETED)
+    for task in done:
+        task.result()
+    tasks.remove(joined)
+    await service.reconcile()
+
+
 async def run(config: Config, command: str):
     log.info("Application starting command=%s mode=%s groups=%s", command, config.mode, len(config.groups))
     # Restrict session/database files created by SQLite and Telethon.
@@ -113,23 +129,11 @@ async def run(config: Config, command: str):
                 finally:
                     queue.task_done()
 
-        # Register handlers before history reads; apply buffered live updates afterwards.
-        await reader.bootstrap(service)
-        consumer = asyncio.create_task(consume())
-        tasks.append(consumer)
-        await client.catch_up()
-        joined = asyncio.create_task(queue.join())
-        tasks.append(joined)
-        done, _ = await asyncio.wait((joined, consumer), return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()
-        tasks.remove(joined)
-        await service.reconcile()
+        # Start the queue worker before any Telegram history or presence requests.
+        await initialize_recovery(reader, service, client, queue, consume, tasks, config.mode)
 
-        tasks.extend([asyncio.create_task(service.worker()),
-                      asyncio.create_task(monitor_reconciliation(client, service, queue)),
+        tasks.extend([asyncio.create_task(monitor_reconciliation(client, service, queue)),
                       asyncio.create_task(client.run_until_disconnected())])
-        log.info("Recovery service started mode=%s groups=%s", config.mode, len(config.groups))
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
