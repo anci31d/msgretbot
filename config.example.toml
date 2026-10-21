@@ -8,3 +8,6 @@ session = "data/observer.session"
 output = "stdout" # "stdout" or "file"
 level = "INFO" # DEBUG includes full exception messages.
 file = "logs/msgretbot.log"
+
+[alerts]
+mode = "loud" # "loud" preserves mentions/profile links; "silent" uses plain names.

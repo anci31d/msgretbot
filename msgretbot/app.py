@@ -100,7 +100,8 @@ async def run(config: Config, command: str):
             sender_id = publisher.id
         else:
             sender, sender_id = UserSender(client, reader.entities), me.id
-        service = Recovery(store, reader, sender, me.id, config.groups, sender_id)
+        service = Recovery(store, reader, sender, me.id, config.groups, sender_id,
+                           alert_mode=config.alerts.mode)
         tasks.append(asyncio.create_task(service.cleaner()))
 
         async def on_message(event):

@@ -51,9 +51,22 @@ def test_logging_defaults_and_file_configuration(config_path):
     assert logging.file == config_path.parent / "logs/test.log"
 
 
+def test_alert_mode_defaults_to_loud_and_accepts_silent(config_path):
+    config_path.write_text('groups=[-10]')
+    assert Config.load(config_path).alerts.mode == "loud"
+    config_path.write_text('groups=[-10]\n[alerts]\nmode="silent"')
+    assert Config.load(config_path).alerts.mode == "silent"
+
+
 @pytest.mark.parametrize("body", [
     'output="stderr"', 'level="EVERYTHING"', 'file="../test.log"'])
 def test_invalid_logging_config(config_path, body):
     config_path.write_text('groups=[-10]\n[logging]\n' + body)
     with pytest.raises(ValueError):
+        Config.load(config_path)
+
+
+def test_invalid_alert_mode(config_path):
+    config_path.write_text('groups=[-10]\n[alerts]\nmode="quiet"')
+    with pytest.raises(ValueError, match="alerts.mode"):
         Config.load(config_path)

@@ -41,7 +41,11 @@ def chunks(text: str, limit: int) -> list[str]:
     return result
 
 
-def author(message: Message) -> str:
+def author(message: Message, *, silent: bool = False) -> str:
+    if silent:
+        if message.username and re.fullmatch(r"[A-Za-z0-9_]{1,32}", message.username):
+            return escape(message.username)
+        return escape((message.name or "Unknown user")[:100])
     if message.username:
         return "@" + escape(message.username)
     name = escape((message.name or "Unknown user")[:100])
@@ -50,9 +54,11 @@ def author(message: Message) -> str:
     return f'<a href="tg://user?id={message.author}">{name}</a>'
 
 
-def context_author(message: Message) -> str:
+def context_author(message: Message, *, silent: bool = False) -> str:
     """Use ordinary profile URLs instead of notification-producing mention entities."""
     if message.username and re.fullmatch(r"[A-Za-z0-9_]{1,32}", message.username):
+        if silent:
+            return escape(message.username)
         return f'<a href="https://t.me/{message.username}">{message.username}</a>'
     # Without a public username Telegram only offers ID mentions, which can notify.
     name = (message.name or "Участник")[:100]
@@ -64,6 +70,9 @@ def context_author(message: Message) -> str:
 class QuoteContext:
     """Render portable quotes; supergroup links can be added by a future formatter."""
 
+    def __init__(self, *, silent: bool = False):
+        self.silent = silent
+
     def render(self, messages: list[Message]) -> str:
         if not messages:
             return "Контекст отсутствует"
@@ -71,13 +80,14 @@ class QuoteContext:
         for index, message in enumerate(messages, 1):
             text = message.text or ""
             quote = text[:99] + "…" if len(text) > 100 else text
-            lines.append(f"{index}. {context_author(message)}: <code>{escape(quote)}</code>")
+            lines.append(f"{index}. {context_author(message, silent=self.silent)}: "
+                         f"<code>{escape(quote)}</code>")
         return "\n".join(lines)
 
 
-def render(message: Message, context: list[Message], formatter=None) -> list[str]:
-    formatter = formatter or QuoteContext()
-    header = f"!!! 1984 АЛЕРТ !!!\nСообщение {author(message)} удалено:\n"
+def render(message: Message, context: list[Message], formatter=None, *, silent: bool = False) -> list[str]:
+    formatter = formatter or QuoteContext(silent=silent)
+    header = f"!!! 1984 АЛЕРТ !!!\nСообщение {author(message, silent=silent)} удалено:\n"
     context_html = "\n" + formatter.render(context)
     # Ten quotes can consume most of Telegram's UTF-16 budget.
     limit = min(2100, 4096 - units(plain_text(header + context_html, strip=False)))

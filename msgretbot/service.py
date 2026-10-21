@@ -13,9 +13,10 @@ log = logging.getLogger(__name__)
 
 class Recovery:
     def __init__(self, store, reader, sender, account: int, groups: tuple[int, ...],
-                 sender_id: int, clock=time.time):
+                 sender_id: int, clock=time.time, alert_mode: str = "loud"):
         self.store, self.reader, self.sender = store, reader, sender
         self.account, self.groups, self.sender_id = account, frozenset(groups), sender_id
+        self.silent_alerts = alert_mode == "silent"
         self.clock = clock
         self.lock = asyncio.Lock()
         self.next_send_at = 0.0
@@ -120,7 +121,7 @@ class Recovery:
             context = await self.context(message)
             if message.sent_at <= self.clock()-TTL:
                 return True
-            parts = render(message, context)
+            parts = render(message, context, silent=self.silent_alerts)
             await self.store.prepare(message, parts)
         else:
             parts = json.loads(row["parts"])

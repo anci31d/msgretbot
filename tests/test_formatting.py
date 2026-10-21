@@ -53,6 +53,22 @@ def test_context_profiles_and_quoted_mentions_are_not_mentions(message):
                                       types.InputMessageEntityMentionName)) for entity in entities)
 
 
+def test_silent_render_has_no_mentions_or_profile_links(message):
+    original = message(username="alice", name="Alice", text="ping @original")
+    context = [message(1, username="bob", name="Bob", text="Ask @alice")]
+    parts = render(original, context, silent=True)
+    assert "Сообщение alice удалено:" in parts[0]
+    assert "1. bob:" in parts[0]
+    assert "@" not in parts[0].split("<pre>", 1)[0]
+    assert "<a " not in parts[0]
+    assert "tg://user" not in parts[0]
+    _, entities = telegram_html.parse(parts[0])
+    assert not any(isinstance(entity, (types.MessageEntityMention,
+                                      types.MessageEntityMentionName,
+                                      types.InputMessageEntityMentionName,
+                                      types.MessageEntityTextUrl)) for entity in entities)
+
+
 @pytest.mark.parametrize("name", ["😀", "\u200b", "\u202eAlice", "𒀀", "A\u0301", "<script>", ""])
 def test_context_unsupported_names_use_placeholder(message, name):
     html = QuoteContext().render([message(username=None, name=name)])

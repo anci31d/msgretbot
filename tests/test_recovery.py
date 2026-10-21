@@ -21,7 +21,7 @@ async def test_filters_and_first_saved_revision(setup, message):
 
 
 async def test_batch_delete_without_chat_and_dedup(setup, message):
-    await setup.service.record(message())
+    await setup.service.record(message(text="ping @original"))
     await setup.service.record(message(11, chat=-20))
     await setup.service.deletion([10, 11, 999])
     await setup.service.deletion([10, 11])
@@ -64,6 +64,27 @@ async def test_media_and_bot_alert_not_recovered(setup, message):
     await setup.service.deletion([10, 11])
     assert not await setup.service.deliver_once()
     assert await setup.service.context(message(12)) == []
+
+
+async def test_alert_mode_is_used_for_delivery(setup, message):
+    from telethon import types
+    from telethon.extensions import html as telegram_html
+
+    await setup.service.record(message())
+    await setup.service.record(message(1, author=30, username="bob", name="Bob", text="context"))
+    service = Recovery(setup.store, setup.reader, setup.sender, 1, (-10, -20), 99,
+                       clock=lambda: setup.clock[0], alert_mode="silent")
+    await service.deletion([10], -10)
+    assert await service.deliver_once()
+    alert = setup.sender.calls[0][1]
+    assert "Сообщение alice удалено:" in alert
+    assert "1. bob:" in alert
+    assert "<a " not in alert
+    _, entities = telegram_html.parse(alert)
+    assert not any(isinstance(entity, (types.MessageEntityMention,
+                                       types.MessageEntityMentionName,
+                                       types.InputMessageEntityMentionName,
+                                       types.MessageEntityTextUrl)) for entity in entities)
 
 
 async def test_userbot_alert_late_event_does_not_create_loop(setup, message):

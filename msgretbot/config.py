@@ -17,6 +17,11 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True)
+class AlertConfig:
+    mode: str = "loud"
+
+
+@dataclass(frozen=True)
 class Config:
     mode: str
     groups: tuple[int, ...]
@@ -26,6 +31,7 @@ class Config:
     api_hash: str = field(repr=False)
     bot_token: str | None = field(default=None, repr=False)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -63,6 +69,12 @@ class Config:
         if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ValueError("Invalid logging.level")
         logging_config = LoggingConfig(output, level, local_path(logging_data.get("file", "logs/msgretbot.log")))
+        alerts_data = data.get("alerts", {})
+        if not isinstance(alerts_data, dict):
+            raise ValueError("alerts must be a TOML table")
+        alert_mode = alerts_data.get("mode", "loud")
+        if alert_mode not in ("loud", "silent"):
+            raise ValueError("alerts.mode must be loud or silent")
         return cls(mode, tuple(groups), local_path(data.get("database", "data/messages.sqlite3")),
                    local_path(data.get("session", "data/observer.session")), api_id, api_hash, token,
-                   logging_config)
+                   logging_config, AlertConfig(alert_mode))
