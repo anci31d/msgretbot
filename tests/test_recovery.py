@@ -87,6 +87,23 @@ async def test_alert_mode_is_used_for_delivery(setup, message):
                                        types.MessageEntityTextUrl)) for entity in entities)
 
 
+async def test_context_message_count_is_configurable(setup, message):
+    for mid in range(1, 8):
+        await setup.service.record(message(mid, text=f"text-{mid}"))
+    limited = Recovery(setup.store, setup.reader, setup.sender, 1, (-10, -20), 99,
+                       clock=lambda: setup.clock[0], context_messages=3)
+    assert [item.id for item in await limited.context(message(8))] == [5, 6, 7]
+
+    disabled = Recovery(setup.store, setup.reader, setup.sender, 1, (-10, -20), 99,
+                        clock=lambda: setup.clock[0], context_messages=0)
+    assert await disabled.context(message(8)) == []
+    await disabled.record(message(8))
+    await disabled.deletion([8], -10)
+    assert await disabled.deliver_once()
+    assert "Контекст:" not in setup.sender.calls[-1][1]
+    assert "Контекст отсутствует" not in setup.sender.calls[-1][1]
+
+
 async def test_userbot_alert_late_event_does_not_create_loop(setup, message):
     setup.service.sender_id = 1
     await setup.service.record(message())

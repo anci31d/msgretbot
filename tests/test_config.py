@@ -54,8 +54,16 @@ def test_logging_defaults_and_file_configuration(config_path):
 def test_alert_mode_defaults_to_loud_and_accepts_silent(config_path):
     config_path.write_text('groups=[-10]')
     assert Config.load(config_path).alerts.mode == "loud"
+    assert Config.load(config_path).alerts.context_messages == 10
     config_path.write_text('groups=[-10]\n[alerts]\nmode="silent"')
     assert Config.load(config_path).alerts.mode == "silent"
+
+
+def test_context_message_count_configuration(config_path):
+    config_path.write_text('groups=[-10]\n[alerts]\ncontext_messages=3')
+    assert Config.load(config_path).alerts.context_messages == 3
+    config_path.write_text('groups=[-10]\n[alerts]\ncontext_messages=0')
+    assert Config.load(config_path).alerts.context_messages == 0
 
 
 @pytest.mark.parametrize("body", [
@@ -69,4 +77,11 @@ def test_invalid_logging_config(config_path, body):
 def test_invalid_alert_mode(config_path):
     config_path.write_text('groups=[-10]\n[alerts]\nmode="quiet"')
     with pytest.raises(ValueError, match="alerts.mode"):
+        Config.load(config_path)
+
+
+@pytest.mark.parametrize("value", ["-1", "11", "true", '""'])
+def test_invalid_context_message_count(config_path, value):
+    config_path.write_text(f'groups=[-10]\n[alerts]\ncontext_messages={value}')
+    with pytest.raises(ValueError, match="context_messages"):
         Config.load(config_path)

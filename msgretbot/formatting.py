@@ -85,10 +85,11 @@ class QuoteContext:
         return "\n".join(lines)
 
 
-def render(message: Message, context: list[Message], formatter=None, *, silent: bool = False) -> list[str]:
+def render(message: Message, context: list[Message], formatter=None, *, silent: bool = False,
+           include_context: bool = True) -> list[str]:
     formatter = formatter or QuoteContext(silent=silent)
     header = f"!!! 1984 АЛЕРТ !!!\nСообщение {author(message, silent=silent)} удалено:\n"
-    context_html = "\n" + formatter.render(context)
+    context_html = "\n" + formatter.render(context) if include_context else ""
     # Ten quotes can consume most of Telegram's UTF-16 budget.
     limit = min(2100, 4096 - units(plain_text(header + context_html, strip=False)))
     if limit < 2:

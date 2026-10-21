@@ -19,6 +19,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class AlertConfig:
     mode: str = "loud"
+    context_messages: int = 10
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,9 @@ class Config:
         alert_mode = alerts_data.get("mode", "loud")
         if alert_mode not in ("loud", "silent"):
             raise ValueError("alerts.mode must be loud or silent")
+        context_messages = alerts_data.get("context_messages", 10)
+        if type(context_messages) is not int or not 0 <= context_messages <= 10:
+            raise ValueError("alerts.context_messages must be an integer from 0 to 10")
         return cls(mode, tuple(groups), local_path(data.get("database", "data/messages.sqlite3")),
                    local_path(data.get("session", "data/observer.session")), api_id, api_hash, token,
-                   logging_config, AlertConfig(alert_mode))
+                   logging_config, AlertConfig(alert_mode, context_messages))

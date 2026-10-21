@@ -278,12 +278,12 @@ class Store:
         for account, chat, mid in keys:
             log.debug("Deletion batch member account=%s chat=%s message=%s", account, chat, mid)
 
-    async def candidates(self, original: Message, now: float) -> list[Message]:
+    async def candidates(self, original: Message, now: float, limit: int = 10) -> list[Message]:
         async with self.lock:
             rows = await (await self.db.execute("""SELECT * FROM messages WHERE account=? AND chat=?
                 AND id<? AND sent_at>? AND own_alert=0 AND kind!='service'
-                AND text IS NOT NULL AND text!='' ORDER BY id DESC LIMIT 10""",
-                (original.account, original.chat, original.id, now-TTL))).fetchall()
+                AND text IS NOT NULL AND text!='' ORDER BY id DESC LIMIT ?""",
+                (original.account, original.chat, original.id, now-TTL, limit))).fetchall()
         return [self.message(row) for row in rows]
 
     async def due(self, account: int, now: float, groups=None, *, pin=False):

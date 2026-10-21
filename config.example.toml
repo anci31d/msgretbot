@@ -11,3 +11,4 @@ file = "logs/msgretbot.log"
 
 [alerts]
 mode = "loud" # "loud" preserves mentions/profile links; "silent" uses plain names.
+context_messages = 10 # 0 disables context; 10 is the supported maximum.

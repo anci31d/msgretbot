@@ -13,10 +13,12 @@ log = logging.getLogger(__name__)
 
 class Recovery:
     def __init__(self, store, reader, sender, account: int, groups: tuple[int, ...],
-                 sender_id: int, clock=time.time, alert_mode: str = "loud"):
+                 sender_id: int, clock=time.time, alert_mode: str = "loud",
+                 context_messages: int = 10):
         self.store, self.reader, self.sender = store, reader, sender
         self.account, self.groups, self.sender_id = account, frozenset(groups), sender_id
         self.silent_alerts = alert_mode == "silent"
+        self.context_messages = context_messages
         self.clock = clock
         self.lock = asyncio.Lock()
         self.next_send_at = 0.0
@@ -79,7 +81,7 @@ class Recovery:
         log.debug("Reconciliation completed")
 
     async def context(self, message: Message):
-        messages = await self.store.candidates(message, self.clock())
+        messages = await self.store.candidates(message, self.clock(), self.context_messages)
         messages.reverse()
         log.debug("Context selected chat=%s message=%s quotes=%s",
                   message.chat, message.id, len(messages))
@@ -121,7 +123,8 @@ class Recovery:
             context = await self.context(message)
             if message.sent_at <= self.clock()-TTL:
                 return True
-            parts = render(message, context, silent=self.silent_alerts)
+            parts = render(message, context, silent=self.silent_alerts,
+                           include_context=self.context_messages > 0)
             await self.store.prepare(message, parts)
         else:
             parts = json.loads(row["parts"])
